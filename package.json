@@ -1,0 +1,28 @@
+{
+  "name": "zebra",
+  "version": "1.0.0",
+  "description": "ZEBRA: SNARK-based Anonymous Credentials",
+  "main": "null",
+  "scripts": {
+    "cred_verify_test": "cd contract && truffle test test/cred-verify-test.js",
+    "batch_L1_test": "cd contract && truffle test test/L1-test.js",
+    "batch_L2_test": "cd contract && truffle test test/L2-test.js",
+    "install_all": "npm install && go get",
+    "ganache_start": "ganache -q -p 7545 -l 50000000000 --mnemonic 'license gasp silver butter memory arctic faculty major story length bean believe index lift engage' &",
+    "user_circuit_size": "mocha --max-old-space-size=4000 user_circuit_size/*.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@truffle/hdwallet-provider": "2.0.7",
+    "bn.js": "5.2.0",
+    "chai": "4.3.6",
+    "ganache": "7.8.0",
+    "truffle": "5.8.4",
+    "circom_tester": "0.0.19",
+    "circomlibjs": "^0.1.4",
+    "mocha": "^9.1.3"
+  },
+  "overrides": {
+    "reselect-tree": "1.3.5"
+  }
+}

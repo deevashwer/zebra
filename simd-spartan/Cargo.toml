@@ -1,0 +1,46 @@
+[package]
+name = "simd-spartan"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ark-ff = { version = "^0.3.0", default-features = false}
+ark-ec = { version = "^0.3.0", default-features = false}
+ark-std = { version = "^0.3.0", default-features = false }
+ark-relations = { version = "^0.3.0", default-features = false}
+ark-crypto-primitives = { version = "^0.3.0", default-features = false, features = [ "r1cs" ] }
+ark-r1cs-std = { version = "^0.3.0", default-features = false}
+ark-nonnative-field = { version = "^0.3.0", default-features = false, optional = true }
+ark-serialize = { version = "^0.3.0", default-features = false}
+ark-poly = { version = "^0.3.0", default-features = false}
+blake2 = { version = "0.9", default-features = false }
+ark-sponge = { version = "^0.3.0", default-features = false}
+hashbrown = {version = "0.9.1"}
+rand = {version =  "0.7.3", default-features = false}
+ark-bn254 = { version = "^0.3.0", default-features = false, features = [ "curve", "r1cs" ] }
+ark-grumpkin = { version = "^0.3.0", default-features = false, features = [ "r1cs" ] }
+derivative = { version = "2", features = ["use_core"] }
+ark-marlin = { git = "https://github.com/arkworks-rs/marlin", branch = "vlopes11/constraints-sponge-rate" }
+ark-groth16 = { version = "^0.3.0", default-features = false, features = [ "r1cs" ] }
+rayon = { version = "1", optional = true }
+
+[dev-dependencies]
+json = "0.12.4"
+
+[features]
+default = ["std", "print-trace", "parallel"]
+std = ["ark-ff/std","ark-r1cs-std/std","ark-nonnative-field/std","ark-std/std", "rand/std", "ark-serialize/std", "ark-ec/std", "ark-sponge/std", "ark-poly/std"]
+print-trace  = ["ark-std/print-trace"]
+parallel = ["rayon"]
+
+[profile.test]
+opt-level = 3
+debug-assertions = true
+incremental = true
+debug = true
+
+[patch.crates-io]
+ark-r1cs-std = { path = "./r1cs-std" }
+ark-grumpkin = { path = "./curves/grumpkin" }
+ark-bn254 = { path = "./curves/bn254" }
+ark-crypto-primitives = { git = "https://github.com/arkworks-rs/crypto-primitives/" }

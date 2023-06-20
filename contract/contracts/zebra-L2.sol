@@ -1,0 +1,266 @@
+pragma solidity ^0.8.0;
+
+// SPDX-License-Identifier: MIT
+
+import "./Pairing.sol";
+
+contract ZebraL2 {
+    using Pairing for *;
+    address private owner = msg.sender;
+
+    uint256[2] public PkCA; // Merkle Root for CA's verification keys
+    uint256[10] public PkA; // Auditor's public key
+    uint256 public RT_ROOT; // Merkle Root for CA's revocation roots
+    uint256 public ROLLUP_STATE; // Merkle Root for Rollup's state
+    Pairing.G1Point[2] preprocessedStaticInputs; // Preprocessed static inputs to SNARK
+
+    function updateRevocationList(uint256 newRoot) public restricted {
+        RT_ROOT = newRoot;
+        updatePreprocessedStaticInputs();
+    }
+
+    function updateCAKeys(uint256[2] calldata _PkCA) public restricted {
+        PkCA = _PkCA;
+    }
+
+    function updateAuditorsPublicKey(uint256[10] calldata _PkA) public restricted {
+        PkA = _PkA;
+    }
+
+    function updateRollupState(uint256 newState) public restricted {
+        ROLLUP_STATE = newState;
+    }
+
+    function updatePreprocessedStaticInputs() public {
+        BatchVerifyingKey[2] memory bvk = [batch64VerifyingKey(), batch512VerifyingKey()];
+
+        for (uint256 i = 0; i < 2; i++) {
+            // Compute the linear combination bvk_x
+            Pairing.G1Point memory bvk_x = Pairing.G1Point(0, 0);
+
+            bvk_x = Pairing.plus(bvk_x, bvk[i].IC[0]);
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[1], PkCA[0]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[2], PkCA[1]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[3], PkA[0]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[4], PkA[1]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[5], PkA[2]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[6], PkA[3]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[7], PkA[4]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[8], PkA[5]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[9], PkA[6]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[10], PkA[7]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[11], PkA[8]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[12], PkA[9]));
+            bvk_x = Pairing.plus(bvk_x, Pairing.scalar_mul(bvk[i].IC[13], RT_ROOT));
+
+            preprocessedStaticInputs[i] = bvk_x;
+        }
+    }
+
+    function splitInt(uint256 input) public pure returns (uint256[2] memory) {
+        return [input >> 128, (input & (2**128 - 1))];
+    }
+
+    // if proof verifies, caches the tokens within the new rollup state `newState`
+    function batchedL2VerificationInit(
+        uint256[2] calldata a,
+        uint256[2][2] calldata b,
+        uint256[2] calldata c,
+        // these are L2 addresses
+        address[] calldata addrs,
+        uint256[] calldata tokens,
+        uint256 newState,
+        uint256 numUsers
+    ) public {
+        uint256 start = 0;
+        bytes32 finalHash = sha256(abi.encodePacked(start));
+        for (uint256 i = 0; i < numUsers; i++) {
+            bytes32 tokenHash = sha256(abi.encodePacked(tokens[i*10:(i+1)*10]));
+            finalHash = sha256(abi.encodePacked(addrs[i], tokenHash, finalHash));
+        }
+
+        uint256[2] memory splitFinalHash = splitInt(uint256(finalHash));
+        uint256[3] memory userInputs = [newState, splitFinalHash[0], splitFinalHash[1]];
+        Pairing.G1Point memory bvk_x = processUserSNARKInputs(userInputs, numUsers);
+
+        require(
+            batchVerifyProofs(a, b, c, bvk_x, numUsers),
+            "Batch L2 Verification (Init) Proof should verify"
+        );
+        updateRollupState(newState);
+    }
+
+    // while verifying the proof, assumes that the tokens were already cached in current `rollupState`
+    // after verification updates the `accessBadgeMap` within the new rollup state `newState`
+    function batchedL2VerificationCached(
+        uint256[2] calldata a,
+        uint256[2][2] calldata b,
+        uint256[2] calldata c,
+        uint256 finalHash,
+        uint256 newState,
+        uint256 numUsers
+    ) public {
+        uint256[2] memory splitFinalHash = splitInt(uint256(finalHash));
+        uint256[3] memory userInputs = [newState, splitFinalHash[0], splitFinalHash[1]];
+        Pairing.G1Point memory bvk_x = processUserSNARKInputs(userInputs, numUsers);
+        require(
+            batchVerifyProofs(a, b, c, bvk_x, numUsers),
+            "Batch L2 Verification (Cached) Proof should verify"
+        );
+        updateRollupState(newState);
+        return;
+    }
+
+    uint256 constant SNARK_SCALAR_FIELD =
+        21888242871839275222246405745257275088548364400416034343698204186575808495617;
+    uint256 constant PRIME_Q =
+        21888242871839275222246405745257275088696311157297823662689037894645226208583;
+
+    struct BatchVerifyingKey {
+        Pairing.G1Point alfa1;
+        Pairing.G2Point beta2;
+        Pairing.G2Point gamma2;
+        Pairing.G2Point delta2;
+        Pairing.G1Point[18] IC;
+    }
+
+    struct Proof {
+        Pairing.G1Point A;
+        Pairing.G2Point B;
+        Pairing.G1Point C;
+    }
+
+    function batch64VerifyingKey()
+        internal
+        pure
+        returns (BatchVerifyingKey memory vk)
+    {
+        vk.alfa1 = Pairing.G1Point(uint256(9447355015739809789109658678579137746545470540647779320435768490411539040537), uint256(7697371205813528422898799245827455065713886026121174530099206856388457401466));
+        vk.beta2 = Pairing.G2Point([uint256(16654878645347337231899769121671423532300035346518871590709980720528299056758), uint256(13895314935036653963896030509441008631947504200065513142870222681025250049705)], [uint256(17227358527800545380224119077823697635597722142659474073561336478918883590544), uint256(14401595103134200176061255378134093651089486621730415497314453942489405688408)]);
+        vk.gamma2 = Pairing.G2Point([uint256(20031091722256464197931342068071953375595746046223890461929203157018032089153), uint256(2933597674803091497128476802465311530708423120494467043600511173275300623795)], [uint256(9801331879725076147137008959433233871513360574198884059990218145734142032657), uint256(18622462855393799596661269260958276744637918467376437278073146486013613401487)]);
+        vk.delta2 = Pairing.G2Point([uint256(7055649422894075291654440014633164995592347236986466928408932581780777819658), uint256(13842906733095198024847344228643686108055833927556424543179612996075870210929)], [uint256(20013837852256607416824593326895306721839232015033447687078122949534843621777), uint256(17223178980440589953890414658401730491751543512667235930293979168382460338144)]);   
+        vk.IC[0] = Pairing.G1Point(uint256(14294547552781058269484999117922611675094124477176623089116103379872837889767), uint256(12552227529693301863242735852475035937273466979770012252066376016511475421554));   
+        vk.IC[1] = Pairing.G1Point(uint256(2969176544272840627575774958377941926935828823987895700340515131938696552763), uint256(7819165925936706831782193955343877020790751544727408816414464805269708972470));   
+        vk.IC[2] = Pairing.G1Point(uint256(10888758629776334614316270302721557291465793216656753110959160484749604676653), uint256(10128019220655326551002092071468553400189834842746115272547226946877643967661));   
+        vk.IC[3] = Pairing.G1Point(uint256(9921957204663621623446029393560013533949150824486954484642645598566742961848), uint256(13929566877773355130810392073705080672755011548455709548030055662997393629435));   
+        vk.IC[4] = Pairing.G1Point(uint256(15993922219866608329621402561764024627525367996207506299124207312555315523233), uint256(13363634503388397442621145003196361514150691042398858208887514662928343602247));   
+        vk.IC[5] = Pairing.G1Point(uint256(10000586026411727273201491364805882873555276655293427853412381525752308800386), uint256(14795919579450813582900863287588759148660074804121957412766699167919478503760));   
+        vk.IC[6] = Pairing.G1Point(uint256(18947678433500337064139710547558108335894534616762383183726600511078998563828), uint256(11548923891416601537352022283344176548924766291907240107253520800047839374554));   
+        vk.IC[7] = Pairing.G1Point(uint256(18118637936294989110465288363022060950994532039969218663549924048100316824582), uint256(7737165857235449347478860300010313052948988148230717174861459624537413865430));   
+        vk.IC[8] = Pairing.G1Point(uint256(19655288968440177049884861894156192968951181115333358607421310074069325173727), uint256(12440445053657235386263565117400977063633435292484061059914988576808117542869));   
+        vk.IC[9] = Pairing.G1Point(uint256(3565684815385189201135204847900104183290544013768121308651661824645537851394), uint256(17975033443649621577489590589479270732464668899940776908544511762606037395878));   
+        vk.IC[10] = Pairing.G1Point(uint256(7126616069889248715361217464408751293875831154730760110890996669153804132121), uint256(14103617706855694429024193808812906814619629230292911260618601908549733353192));   
+        vk.IC[11] = Pairing.G1Point(uint256(4937163090525729168445090498125324158675528524468634944926246898238151400085), uint256(8557592072524017537077623211975450445369005036242641592643722660267449607555));   
+        vk.IC[12] = Pairing.G1Point(uint256(16357539805083395789750004795438347795299315900821806713923080726913560434031), uint256(11936326946452741024629032306161485184691122348254520872104364242988154381571));   
+        vk.IC[13] = Pairing.G1Point(uint256(9457183585751350019818476929694823073904526696690361814695354847666112921554), uint256(5020963181717053268789191117677264155925456097376684638762776898370736765526));   
+        vk.IC[14] = Pairing.G1Point(uint256(9479268756208810870774659426698126361110174413594452174087542719880789672902), uint256(4242752850948526481527574264517363395463896615100328476038059534322535592073));   
+        vk.IC[15] = Pairing.G1Point(uint256(6331677673201412017554361270438646052295454748091021158319878500564218257932), uint256(15054774816592219810345908367994252909454566769935592772232482696068185633385));   
+        vk.IC[16] = Pairing.G1Point(uint256(20344738525015310537146521300640157959013755595463866907535210449598323277037), uint256(15784097601532233836897096785431386037932865990691291865324555605453553894287));   
+        vk.IC[17] = Pairing.G1Point(uint256(18342225167803583999828602394248354505989585973645973450222005969436854512618), uint256(3970828288712598983248947137342200088648568502880172419259807406499799415712));
+    }
+
+    function batch512VerifyingKey()
+        internal
+        pure
+        returns (BatchVerifyingKey memory vk)
+    {
+        vk.alfa1 = Pairing.G1Point(uint256(7400906440673956495885894732702131022494541513638107746289057513792837952675), uint256(5972787944824720034331550419278311647980858772845581475829597107941698330897));
+        vk.beta2 = Pairing.G2Point([uint256(11215854432395513710223826383905088785547518293805973350633554789406151492330), uint256(3716530940089781235194425253857565674330012339144244235998016087896337652718)], [uint256(10260027811047374025826442770565934455903241263950946049658329631681291552695), uint256(6115379076203879340310057202776790323883729068249518128196531930273785215131)]);
+        vk.gamma2 = Pairing.G2Point([uint256(17609949070736680609549428665001085292172468103308703662551745477198649584237), uint256(9301311913903719747790560828976260331258739865834940988285797804131456452249)], [uint256(7613841789035759840768109128695745474658816086570063442610862136991010388829), uint256(136605177189251699195483140750400369622409340724328551947695718851397557107)]);
+        vk.delta2 = Pairing.G2Point([uint256(20392288826651299129345420521826743012310705949418655063895162014759638560667), uint256(1929326733857192990285604178242046653214499760074747547061473425731519851605)], [uint256(7004878665613499502792992333442190258119460889074515161672181616937880158422), uint256(19625479894966322627668253967504393912399368209346328857455540009594454904299)]);   
+        vk.IC[0] = Pairing.G1Point(uint256(5543766432070518045422131816057624009356692246466221428370920544117333709961), uint256(13628991822138585500937689807509855898930239608519025405305578166368656806899));   
+        vk.IC[1] = Pairing.G1Point(uint256(2372715977816482462928371443873787851611984828276285523351784980078162880594), uint256(8165933322139568761831418271585878476486697651930650692423858323445686488937));   
+        vk.IC[2] = Pairing.G1Point(uint256(19420463572449367072892943272265270089979707845591168533869419668593455148101), uint256(19180969674093102779830300725402443394223413435337729100139408486864337309332));   
+        vk.IC[3] = Pairing.G1Point(uint256(9026677624380422956552576264874402043519089303471819219681734931686421098678), uint256(20354171724050421293223486874684166314173118385820375286991515431613341977422));   
+        vk.IC[4] = Pairing.G1Point(uint256(9068335232399863829769712172230149378184220320943660436458996179625714074042), uint256(8141771802658676765392917307136815480140665103130986216719251007810306222868));   
+        vk.IC[5] = Pairing.G1Point(uint256(2813747775031786814441555188133374347847435581128410819207758334326423396945), uint256(16046509623681873225556070353003357902489898072156907647150561491824804015027));   
+        vk.IC[6] = Pairing.G1Point(uint256(1880552836611278014844939219890199617986091983338079685963815397640588864072), uint256(21244056802096935141262363918519224304640210042605745715645058530329232596755));   
+        vk.IC[7] = Pairing.G1Point(uint256(20915782475220260404111874335936621312893526603877554226305586496886638116421), uint256(7725214554513394752684154028190744888281594440223853613688506754430950421136));   
+        vk.IC[8] = Pairing.G1Point(uint256(18243989103356883074557348120705514229672024854740459763096978102435586166776), uint256(5690044797696443569046948513269273607559892462130914807634930453206425680222));   
+        vk.IC[9] = Pairing.G1Point(uint256(1772472455888711891328853258548620269767520286353734084509620764619611203713), uint256(16009876268116096005477048831877646289202142185851334915710669297350313685195));   
+        vk.IC[10] = Pairing.G1Point(uint256(17115115895892234899297160863837114728536251535382842651705768159679450584725), uint256(13579267055325682007176703470772333495545895839664846067043343834546860339036));   
+        vk.IC[11] = Pairing.G1Point(uint256(3207809327593070220107441463595577402404562792282398602061146494158103212330), uint256(406461247884280089280425188688782329028181028574868769692566295503900760964));   
+        vk.IC[12] = Pairing.G1Point(uint256(16863686828705427949077910404459181319432223447292757926707070238063904399967), uint256(1523972695205404583787081737452472032628223026688638694735533455038690505738));   
+        vk.IC[13] = Pairing.G1Point(uint256(18476949102511059517201984700060352335744588784580509717843740543118763802637), uint256(17668475352726704864280370367832248674808424728243579369457011324157794816048));   
+        vk.IC[14] = Pairing.G1Point(uint256(18713804727451410367109748281586298533020071795815624836063339359338805849795), uint256(12988786458805922255377618070789937605821681571243018498164313424336078544549));   
+        vk.IC[15] = Pairing.G1Point(uint256(17240798926856360724258236101902840844994900554808222798788961163331916720084), uint256(10394496726558316736981468808291281871880265856387669958850064830482559697717));   
+        vk.IC[16] = Pairing.G1Point(uint256(12912460238126398593699745102972207508368467851772002585005354513781697878866), uint256(20728345302375313703603076161857751032607776112220016576070949908943894416455));   
+        vk.IC[17] = Pairing.G1Point(uint256(12434254065095519160181459413916344269789694568554508093975728974688407588304), uint256(20237834513386030114820129087162438164138390648859272713110907330812586021087));
+    }
+
+    function processUserSNARKInputs(uint256[3] memory input, uint256 numUsers)
+        public
+        view
+        returns (Pairing.G1Point memory vk_x)
+    {
+        require(numUsers == 64 || numUsers == 512, "numUsers must be 64 or 512");
+        BatchVerifyingKey memory bvk = numUsers == 64 ? batch64VerifyingKey() : batch512VerifyingKey();
+
+        Pairing.G1Point memory _bvk_x = Pairing.G1Point(0, 0);
+        _bvk_x = Pairing.plus(_bvk_x, Pairing.scalar_mul(bvk.IC[14], ROLLUP_STATE));
+
+        for (uint256 i = 0; i < input.length; i++) {
+            require(
+                input[i] < SNARK_SCALAR_FIELD,
+                "verifier-gte-snark-scalar-field"
+            );
+            _bvk_x = Pairing.plus(
+                _bvk_x,
+                // first 14 inputs are common to all users and already preprocessed
+                Pairing.scalar_mul(bvk.IC[i + 15], input[i])
+            );
+        }
+        return _bvk_x;
+    }
+
+    function batchVerifyProofs(
+        uint256[2] calldata a,
+        uint256[2][2] calldata b,
+        uint256[2] calldata c,
+        Pairing.G1Point memory bvk_x,
+        uint256 numUsers
+    ) public view returns (bool r) {
+        Proof memory proof;
+        proof.A = Pairing.G1Point(a[0], a[1]);
+        proof.B = Pairing.G2Point([b[0][0], b[0][1]], [b[1][0], b[1][1]]);
+        proof.C = Pairing.G1Point(c[0], c[1]);
+
+        BatchVerifyingKey memory bvk = numUsers == 64 ? batch64VerifyingKey() : batch512VerifyingKey();
+
+        // Make sure that proof.A, B, and C are each less than the prime q
+        require(proof.A.X < PRIME_Q, "verifier-aX-gte-prime-q");
+        require(proof.A.Y < PRIME_Q, "verifier-aY-gte-prime-q");
+
+        require(proof.B.X[0] < PRIME_Q, "verifier-bX0-gte-prime-q");
+        require(proof.B.Y[0] < PRIME_Q, "verifier-bY0-gte-prime-q");
+
+        require(proof.B.X[1] < PRIME_Q, "verifier-bX1-gte-prime-q");
+        require(proof.B.Y[1] < PRIME_Q, "verifier-bY1-gte-prime-q");
+
+        require(proof.C.X < PRIME_Q, "verifier-cX-gte-prime-q");
+        require(proof.C.Y < PRIME_Q, "verifier-cY-gte-prime-q");
+
+        Pairing.G1Point memory preprocessedInputs = (numUsers == 64) ? preprocessedStaticInputs[0] : preprocessedStaticInputs[1];
+        bvk_x = Pairing.plus(bvk_x, preprocessedInputs);
+
+        return
+            Pairing.pairing(
+                Pairing.negate(proof.A),
+                proof.B,
+                bvk.alfa1,
+                bvk.beta2,
+                bvk_x,
+                bvk.gamma2,
+                proof.C,
+                bvk.delta2
+            );
+    }
+
+    modifier restricted() {
+        require(
+            msg.sender == owner,
+            "This function is restricted to the contract's owner"
+        );
+        _;
+    }
+}
